@@ -2,268 +2,288 @@
 #include <ESP8266WebServer.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include <DHT.h>
-#include <WebSocketsServer.h> // Add this library for WebSocket support
+#include <SPI.h>
+#include <RF24.h>
 
-#define DHTPIN 4
-#define DHTTYPE DHT22
-#define WATER_LEVEL_SENSOR_PIN A0
-#define PUMP_PIN 14
+#define CE_PIN 4
+#define CSN_PIN 5
+
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "00001";
 
 const char* ssid = "NARZO N65 5G";
-const char* password = "v2ar6b3q";
+const char* password = "12345678";
 
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+const int moistureSensorPin = A0;
+const int relayPin = 0;
+
+int lowerThreshold = 400;
+int upperThreshold = 500;
+
+String mode = "Manual";
+bool pumpStatus = false;  // false means motor is off
+unsigned long timerDuration = 0;
+unsigned long startTime = 0;
+
 ESP8266WebServer server(80);
-WebSocketsServer webSocket(81); // WebSocket server on port 81
-DHT dht(DHTPIN, DHTTYPE);
+unsigned long lastWiFiCheck = 0;
+unsigned long checkInterval = 30000; // 30 seconds to check WiFi connection
 
-int irrigationStartYear = 0, irrigationStartMonth = 0, irrigationStartDay = 0;
-int irrigationStartHour = 0, irrigationStartMinute = 0;
-int irrigationDurationMinutes = 0;
-bool pumpStatus = false;
+int receivedSoilMoisture = 0;
+
+int readSoilMoisture() {
+    int rawValue = analogRead(moistureSensorPin);
+    rawValue = 1024 - rawValue; // Subtract from 1024 to invert the reading
+
+    return rawValue; // Directly return the raw reading
+}
+
+void controlPump(bool state) {
+    pumpStatus = state;
+    Serial.print("Control Pump: ");
+    Serial.println(state ? "ON" : "OFF");
+    digitalWrite(relayPin, state ? HIGH : LOW); // LOW turns motor ON, HIGH turns motor OFF
+}
+
+String getMotorStatus() {
+    return pumpStatus ? "ON" : "OFF";
+}
+
+void handleStatusUpdate() {
+    String json = "{";
+    json += "\"soilMoisture\":" + String(readSoilMoisture()) + ",";
+    json += "\"receivedSoilMoisture\":" + String(receivedSoilMoisture) + ",";
+    json += "\"motorStatus\":\"" + getMotorStatus() + "\",";
+    json += "\"lowerThreshold\":" + String(lowerThreshold) + ",";
+    json += "\"upperThreshold\":" + String(upperThreshold) + ",";
+    json += "\"mode\":\"" + mode + "\",";
+
+    // Calculate remaining time if a timer is set
+    unsigned long remainingTime = (timerDuration > 0) ? (startTime + timerDuration - millis()) / 1000 : 0;
+    json += "\"remainingTime\":" + String(remainingTime);
+    
+    json += "}";
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", json);
+}
+
+void handlePumpControl() {
+    if (server.hasArg("action")) {
+        String action = server.arg("action");
+        if (action == "on") controlPump(true);   // Turns motor ON
+        if (action == "off") controlPump(false); // Turns motor OFF
+        if (action == "auto") mode = "Auto";
+        if (action == "manual") mode = "Manual";
+    }
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "text/plain", "OK");
+}
+
+void handleSetTimer() {
+    if (server.hasArg("timer")) {
+        // Convert minutes to milliseconds
+        unsigned long minutes = server.arg("timer").toInt();
+        timerDuration = minutes * 60000; // Convert minutes to milliseconds
+        startTime = millis();
+        controlPump(true);  // Turn on the motor for the duration of the timer
+    }
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "text/plain", "Timer set");
+}
+
+void handleTimer() {
+    if (millis() - startTime >= timerDuration && timerDuration > 0) {
+        controlPump(false);  // Turn off the motor when the timer is done
+        timerDuration = 0;
+    }
+}
+
+// Automatically reconnect to WiFi
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected, attempting reconnection...");
+        WiFi.begin(ssid, password);
+        while (WiFi.status() != WL_CONNECTED) {
+            delay(1000);
+            Serial.print(".");
+        }
+        Serial.println("Reconnected to WiFi.");
+    }
+}
 
 void setup() {
-  Serial.begin(115200);
-  dht.begin();
-  
-  pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
-  pinMode(PUMP_PIN, OUTPUT);
-  digitalWrite(PUMP_PIN, LOW);
+    Serial.begin(115200);
+    pinMode(relayPin, OUTPUT);
+    digitalWrite(relayPin, LOW); // Ensure motor is off initially
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("Connected to WiFi");
-  
-  // Print the IP address to the Serial Monitor
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+    // Set static IP configuration
+    IPAddress staticIP(192, 168, 182, 99); // Desired IP address
+    IPAddress gateway(192, 168, 216, 1);   // Replace with your network's gateway
+    IPAddress subnet(255, 255, 255, 0);    // Subnet mask
+    IPAddress dns(8, 8, 8, 8);             // DNS server (you can use Google's DNS or your router's DNS)
 
-  timeClient.begin();
-  
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/schedule", HTTP_GET, handleSchedule);
-  server.on("/pump/on", HTTP_GET, handlePumpOn);
-  server.on("/pump/off", HTTP_GET, handlePumpOff);
-  server.on("/pump/state", HTTP_GET, handlePumpState);
-  server.on("/temperature", HTTP_GET, handleTemperature);
-  server.on("/humidity", HTTP_GET, handleHumidity);
-  server.on("/water-level", HTTP_GET, handleWaterLevel);
-  
-  server.begin();
-  Serial.println("HTTP server started");
+    WiFi.config(staticIP, gateway, subnet, dns); // Set static IP configuration
+    WiFi.begin(ssid, password);                  // Connect to WiFi
+    
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        Serial.print(".");
+    }
+    Serial.println("Connected to WiFi");
 
-  webSocket.begin();  // Initialize WebSocket
-  webSocket.onEvent(webSocketEvent); // Register WebSocket event handler
+    // Print the IP address
+    Serial.print("Web server IP address: ");
+    Serial.println(WiFi.localIP());
+
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/html", generatePage());
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+    });
+
+    server.on("/status", HTTP_GET, handleStatusUpdate);
+    server.on("/control", HTTP_POST, handlePumpControl);
+    server.on("/set_timer", HTTP_POST, handleSetTimer);
+
+    server.begin();
+    if (!radio.begin()) {
+        Serial.println("NRF24L01 is NOT ready or not connected!");
+        while (1); // Halt further execution
+    }
+    
+    radio.setPALevel(RF24_PA_LOW);
+    radio.setChannel(108);
+    radio.openReadingPipe(1, address);
+    radio.startListening(); // Start listening for messages
+
+    Serial.println("NRF24L01 Receiver is ready. Waiting for messages...");
 }
 
 void loop() {
-  server.handleClient();
-  webSocket.loop();  // Handle WebSocket events
-
-  timeClient.update();
-  
-  // Get current time
-  time_t epochTime = timeClient.getEpochTime();
-  struct tm* timeInfo = localtime(&epochTime);
-
-  int currentYear = timeInfo->tm_year + 1900;
-  int currentMonth = timeInfo->tm_mon + 1;
-  int currentDay = timeInfo->tm_mday;
-  int currentHour = timeInfo->tm_hour;
-  int currentMinute = timeInfo->tm_min;
-
-  // Auto-off feature: check water level and stop the pump if it exceeds the threshold
-  if (pumpStatus) {
-    int waterLevel = analogRead(WATER_LEVEL_SENSOR_PIN);
-    if (waterLevel > 800) { // Replace with your high threshold value
-      turnPumpOff(); // Turn off the pump if water level exceeds the threshold
-      Serial.println("Pump turned off due to high water level.");
+    server.handleClient();
+    handleTimer();
+    checkAutoMode();
+    if (millis() - lastWiFiCheck > checkInterval) {
+        lastWiFiCheck = millis();
+        checkWiFiConnection();
     }
-  }
-
-  // Check if it's time to start or stop the irrigation based on the schedule
-  if (irrigationStartYear == currentYear && 
-      irrigationStartMonth == currentMonth && 
-      irrigationStartDay == currentDay &&
-      irrigationStartHour == currentHour && 
-      irrigationStartMinute == currentMinute) {
-    turnPumpOn(); // Start the pump at the scheduled time
-    Serial.println("Pump started according to schedule.");
-    delay(irrigationDurationMinutes * 60000); // Run the pump for the scheduled duration
-    turnPumpOff(); // Stop the pump after the scheduled duration
-    Serial.println("Pump stopped after scheduled duration.");
-  }
-
-  // Broadcast updated sensor data via WebSocket
-  if (webSocket.connectedClients() > 0) { // Ensure at least one client is connected
-    float temperature = dht.readTemperature();
-    float humidity = dht.readHumidity();
-    int waterLevel = analogRead(WATER_LEVEL_SENSOR_PIN);
-    
-    if (isnan(temperature)) temperature = 0;
-    if (isnan(humidity)) humidity = 0;
-
-    String data = "{";
-    data += "\"temperature\":\"" + String(temperature) + "\",";
-    data += "\"humidity\":\"" + String(humidity) + "\",";
-    data += "\"waterLevel\":\"" + String(waterLevel) + "\"";
-    data += "}";
-
-    webSocket.broadcastTXT(data); // Send data to all connected WebSocket clients
-  }
+    if (radio.available()) {
+        int soilMoistureValue = 0; // Change this to int to match sender
+        radio.read(&soilMoistureValue, sizeof(soilMoistureValue)); // Read the soil moisture level
+        receivedSoilMoisture = soilMoistureValue; // Store the value to be displayed on the webpage
+    }
+    delay(100); // Slight delay to prevent flooding the Serial Monitor
 }
 
-void turnPumpOn() {
-  digitalWrite(PUMP_PIN, HIGH);
-  pumpStatus = true;
+void checkAutoMode() {
+    if (mode == "Auto") {
+        int soilMoisture = readSoilMoisture(); // Read current soil moisture
+        // Use the global value stored from the radio
+        int currentReceivedSoilMoisture = receivedSoilMoisture; 
+         Serial.print("Inverted Soil Moisture Level: ");
+          Serial.println(currentReceivedSoilMoisture);
+
+        // Debugging output
+        //Serial.print("Soil Moisture: ");
+        //Serial.print(soilMoisture);
+        //Serial.print(", Received Soil Moisture: ");
+        //Serial.println(currentReceivedSoilMoisture);
+        //Serial.print("Lower Threshold: ");
+        //Serial.println(lowerThreshold);
+        //Serial.print("Upper Threshold: ");
+        //Serial.println(upperThreshold);
+
+        // Check conditions to control the pump
+        if (soilMoisture < lowerThreshold || currentReceivedSoilMoisture < lowerThreshold) {
+            //Serial.println("Turning ON the pump.");
+            controlPump(true);  // Turn ON the pump if either reading is below the lower threshold
+        } 
+        else if (soilMoisture > upperThreshold && currentReceivedSoilMoisture > upperThreshold) {
+            //Serial.println("Turning OFF the pump.");
+            controlPump(false); // Turn OFF the pump only if both readings are above the upper threshold
+        }
+    }
 }
 
-void turnPumpOff() {
-  digitalWrite(PUMP_PIN, LOW);
-  pumpStatus = false;
-}
+String generatePage() {
+  String html = "<html><head>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; align-items: center; background-color: #e0f7e0; }"; // Light green background
+  html += "h1 { color: #333; font-size: 48px; margin-bottom: 10px; }";  // Increased font size for company name
+  html += "h2 { color: #666; font-size: 32px; margin-bottom: 20px; }";  // Increased font size for title
+  html += "p { font-size: 22px; margin: 5px 0; }";  // Increased font size for paragraphs
+  html += "button { font-size: 22px; padding: 20px 40px; margin: 10px; border: none; border-radius: 8px; cursor: pointer; }";  // Increased button size
+  html += ".btn-on { background-color: #4CAF50; color: white; }";
+  html += ".btn-off { background-color: #f44336; color: white; }";
+  html += ".btn-mode { background-color: #2196F3; color: white; }";
+  html += "input[type=text] { padding: 15px; font-size: 18px; border-radius: 8px; border: 1px solid #ccc; width: 200px; text-align: center; }";
+  html += ".container { max-width: 900px; width: 100%; padding: 20px; box-sizing: border-box; text-align: center; }";
+  html += ".timer-section { margin: 20px 0; }";  // Margin for timer section
+  html += ".timer-input { font-size: 18px; padding: 15px; border-radius: 8px; border: 2px solid #2196F3; width: 220px; text-align: center; }";
+  html += ".timer-button { font-size: 22px; padding: 20px 40px; border: none; border-radius: 8px; cursor: pointer; background-color: #2196F3; color: white; }";
+  html += ".timer-button:hover { background-color: #1976D2; }";  // Hover effect for timer button
+  html += "@media (max-width: 600px) {";
+  html += "  body { font-size: 16px; }";
+  html += "  button { font-size: 18px; padding: 15px 30px; }";
+  html += "  input[type=text] { font-size: 16px; padding: 12px; }";
+  html += "  h1 { font-size: 36px; }";  // Adjusted size for smaller screens
+  html += "  h2 { font-size: 24px; }";  // Adjusted size for smaller screens
+  html += "}";
+  html += "</style>";
+  html += "<script>";
+  html += "function updateStatus() {";
+  html += "  var xhr = new XMLHttpRequest();";
+  html += "  xhr.onreadystatechange = function() {";
+  html += "    if (xhr.readyState == 4 && xhr.status == 200) {";
+  html += "      var json = JSON.parse(xhr.responseText);";
+  html += "      document.getElementById('soilMoisture').innerHTML = json.soilMoisture;";
+  html += "      document.getElementById('receivedSoilMoisture').innerHTML = json.receivedSoilMoisture;";
+  html += "      document.getElementById('motorStatus').innerHTML = json.motorStatus;";
+  html += "      document.getElementById('lowerThreshold').innerHTML = json.lowerThreshold;";
+  html += "      document.getElementById('upperThreshold').innerHTML = json.upperThreshold;";
+  html += "      document.getElementById('mode').innerHTML = json.mode;";
+  html += "      document.getElementById('remainingTime').innerHTML = json.remainingTime;";
+  html += "    }";
+  html += "  };";
+  html += "  xhr.open('GET', '/status', true);";
+  html += "  xhr.send();";
+  html += "}";
 
-void handleRoot() {
-  String html = "<!DOCTYPE html>\
-  <html lang='en'>\
-  <head>\
-    <meta charset='UTF-8'>\
-    <meta name='viewport' content='width=device-width, initial-scale=1.0'>\
-    <title>Smart Irrigation System</title>\
-    <style>\
-      body { font-family: Arial, sans-serif; background-color: #e8f5e9; }\
-      h1 { color: #388e3c; }\
-      p { margin: 5px 0; }\
-      button { margin: 5px; }\
-    </style>\
-  </head>\
-  <body>\
-    <h1>JAMBAVANTHA Smart Irrigation System</h1>\
-    <p>Temperature: <span id='temperature'>Loading...</span></p>\
-    <p>Humidity: <span id='humidity'>Loading...</span></p>\
-    <p>Water Level: <span id='waterLevel'>Loading...</span></p>\
-    <p>Motor Status: <span id='motorState'>Loading...</span></p>\
-    <p>Schedule: <span id='schedule'>Not Set</span></p>\
-    <button onclick='turnOnPump()'>Turn Pump On</button><br>\
-    <button onclick='turnOffPump()'>Turn Pump Off</button><br>\
-    <form action='/schedule' method='get' onsubmit='return validateSchedule()'>\
-      <label for='date'>Irrigation Date (YYYY-MM-DD):</label>\
-      <input type='date' id='date' name='date' required><br>\
-      <label for='time'>Irrigation Start Time (HH:MM):</label>\
-      <input type='time' id='time' name='time' required><br>\
-      <label for='duration'>Duration (minutes):</label>\
-      <input type='number' id='duration' name='duration' required><br>\
-      <input type='submit' value='Set Schedule'>\
-    </form><br>\
-    <p>Your ESP8266 IP Address: <span id='ipAddress'>" + WiFi.localIP().toString() + "</span></p>\
-    <script>\
-      var ws = new WebSocket('ws://' + location.hostname + ':81');\
-      ws.onmessage = function(event) {\
-        var data = JSON.parse(event.data);\
-        document.getElementById('temperature').innerHTML = data.temperature;\
-        document.getElementById('humidity').innerHTML = data.humidity;\
-        document.getElementById('waterLevel').innerHTML = data.waterLevel;\
-      };\
-      function turnOnPump() {\
-        var xhr = new XMLHttpRequest();\
-        xhr.open('GET', '/pump/on', true);\
-        xhr.send();\
-      }\
-      function turnOffPump() {\
-        var xhr = new XMLHttpRequest();\
-        xhr.open('GET', '/pump/off', true);\
-        xhr.send();\
-      }\
-      function updateMotorState() {\
-        var xhr = new XMLHttpRequest();\
-        xhr.onreadystatechange = function() {\
-          if (xhr.readyState == 4 && xhr.status == 200) {\
-            document.getElementById('motorState').innerHTML = xhr.responseText;\
-          }\
-        };\
-        xhr.open('GET', '/pump/state', true);\
-        xhr.send();\
-      }\
-      function updateSchedule() {\
-        var xhr = new XMLHttpRequest();\
-        xhr.onreadystatechange = function() {\
-          if (xhr.readyState == 4 && xhr.status == 200) {\
-            document.getElementById('schedule').innerHTML = xhr.responseText;\
-          }\
-        };\
-        xhr.open('GET', '/schedule', true);\
-        xhr.send();\
-      }\
-      function validateSchedule() {\
-        // Optional: Add custom validation if needed\
-        return true;\
-      }\
-      // Update every 5 seconds\
-      setInterval(updateMotorState, 5000);\
-      setInterval(updateSchedule, 5000);\
-    </script>\
-  </body>\
-  </html>";
-  server.send(200, "text/html", html);
-}
+  html += "function controlPump(action) {";
+  html += "  var xhr = new XMLHttpRequest();";
+  html += "  xhr.open('POST', '/control', true);";
+  html += "  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');";
+  html += "  xhr.send('action=' + action);";
+  html += "}";
 
-void handleSchedule() {
-  String dateParam = server.arg("date");
-  String timeParam = server.arg("time");
-  String durationParam = server.arg("duration");
-  
-  if (dateParam.length() > 0 && timeParam.length() > 0 && durationParam.length() > 0) {
-    // Extract year, month, day, hour, minute from the parameters
-    irrigationStartYear = dateParam.substring(0, 4).toInt();
-    irrigationStartMonth = dateParam.substring(5, 7).toInt();
-    irrigationStartDay = dateParam.substring(8, 10).toInt();
-    irrigationStartHour = timeParam.substring(0, 2).toInt();
-    irrigationStartMinute = timeParam.substring(3, 5).toInt();
-    irrigationDurationMinutes = durationParam.toInt();
-    server.send(200, "text/plain", "Schedule updated");
-  } else {
-    server.send(400, "text/plain", "Invalid schedule parameters");
-  }
-}
+  html += "function setTimer() {";
+  html += "  var timer = document.getElementById('timerInput').value;";
+  html += "  var xhr = new XMLHttpRequest();";
+  html += "  xhr.open('POST', '/set_timer', true);";
+  html += "  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');";
+  html += "  xhr.send('timer=' + timer);";
+  html += "}";
 
-void handlePumpOn() {
-  turnPumpOn();
-  server.send(200, "text/plain", "Pump turned on");
-}
-
-void handlePumpOff() {
-  turnPumpOff();
-  server.send(200, "text/plain", "Pump turned off");
-}
-
-void handlePumpState() {
-  server.send(200, "text/plain", pumpStatus ? "On" : "Off");
-}
-
-void handleTemperature() {
-  float temperature = dht.readTemperature();
-  server.send(200, "text/plain", isnan(temperature) ? "Error" : String(temperature));
-}
-
-void handleHumidity() {
-  float humidity = dht.readHumidity();
-  server.send(200, "text/plain", isnan(humidity) ? "Error" : String(humidity));
-}
-
-void handleWaterLevel() {
-  int waterLevel = analogRead(WATER_LEVEL_SENSOR_PIN);
-  server.send(200, "text/plain", String(waterLevel));
-}
-
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  if (type == WStype_TEXT) {
-    String message = String((char*)payload);
-    Serial.printf("WebSocket message received: %s\n", message.c_str());
-    // Handle WebSocket message if needed
-  }
+  html += "setInterval(updateStatus, 1000);";  
+  html += "</script></head><body>";
+  html += "<div class='container'>";
+  html += "<h1>JAMBAVANTHA</h1>";  // Company name
+  html += "<h2>AI Powered Smart Irrigation and Crop Management System</h2>";  // Page title
+  html += "<p>Soil Moisture: <span id='soilMoisture'></span></p>";
+  html += "<p>Received Soil Moisture: <span id='receivedSoilMoisture'></span></p>"; // Add this line for received soil moisture
+  html += "<p>Motor Status: <span id='motorStatus'></span></p>";
+  html += "<p>Lower Threshold: <span id='lowerThreshold'></span></p>";
+  html += "<p>Upper Threshold: <span id='upperThreshold'></span></p>";
+  html += "<p>Mode: <span id='mode'></span></p>";
+  html += "<p>Remaining Time: <span id='remainingTime'></span> seconds</p>";
+  html += "<button class='btn-mode' onclick=\"controlPump('manual')\">Switch to Manual Mode</button>";
+  html += "<button class='btn-mode' onclick=\"controlPump('auto')\">Switch to Auto Mode</button>";
+  html += "<br><button class='btn-on' onclick=\"controlPump('on')\">Turn Pump ON</button>";
+  html += "<button class='btn-off' onclick=\"controlPump('off')\">Turn Pump OFF</button>";
+  html += "<div class='timer-section'>";
+  html += "<p>Set Timer (minutes):</p>";
+  html += "<input type=\"text\" id=\"timerInput\" class='timer-input'>";
+  html += "<button class='timer-button' onclick=\"setTimer()\">Set Timer</button>";
+  html += "</div>";
+  html += "</div></body></html>";
+  return html;
 }
